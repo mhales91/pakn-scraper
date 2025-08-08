@@ -27,6 +27,7 @@ jobs:
 
       - name: Restore & Build
         run: |
+          set -euxo pipefail
           dotnet restore src/PakScraper.csproj
           dotnet build src/PakScraper.csproj -c Release
 
@@ -34,22 +35,26 @@ jobs:
         working-directory: src/bin/Release/net6.0
         run: pwsh ./playwright.ps1 install chromium
 
-      # ✅ This starts Xvfb and exports DISPLAY for you
-      - name: Ensure Playwright deps & Xvfb
-        uses: microsoft/playwright-github-action@v1
-        with:
-          xvfb: true
+      # ✅ Install Xvfb and start a virtual display. No deprecated actions.
+      - name: Install Xvfb
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y xvfb
 
-      # (debug) prove we’re using the right workflow and have DISPLAY
+      # (debug) prove we’re in the right workflow and show DISPLAY
       - name: Debug mark
         run: |
           echo "HIT THE RIGHT WORKFLOW ✅"
           echo "DISPLAY is: ${DISPLAY:-<unset>}"
 
-      # Run in headless mode (arg after `--` goes to your app)
-      - name: Run the scraper (headless, capture JSON)
+      # ✅ Run Playwright under Xvfb so headed Chromium works in CI
+      # If your app *still* ignores headless, this will handle it anyway.
+      - name: Run the scraper (capture JSON)
         run: |
-          dotnet run --project src/PakScraper.csproj -- headless > out.json
+          set -euxo pipefail
+          xvfb-run -a -s "-screen 0 1280x720x24" \
+            dotnet run --project src/PakScraper.csproj > out.json
           echo "Wrote scraper output to out.json"
 
       # Deps to push data to Google Sheets
@@ -95,7 +100,6 @@ jobs:
             print("No JSON records parsed from scraper output.", file=sys.stderr)
             sys.exit(0)
 
-          # --- Normalize to tabular ---
           df = pd.json_normalize(data)
           now = datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z"
           if "ingested_at" not in df.columns:
@@ -103,7 +107,6 @@ jobs:
           cols = list(df.columns)
           df = df[cols]
 
-          # --- Auth & write to Sheets ---
           creds = Credentials.from_service_account_info(
             json.loads(os.environ["GCP_SA_KEY"]),
             scopes=["https://www.googleapis.com/auth/spreadsheets"]

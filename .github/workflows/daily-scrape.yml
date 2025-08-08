@@ -2,7 +2,8 @@ name: Daily Pak'nSave Scrape → Google Sheets
 
 on:
   schedule:
-    - cron: "0 18 * * *"   # 6:00 AM NZST / 7:00 AM NZDT
+    # 18:00 UTC daily = 6:00 AM NZST / 7:00 AM NZDT
+    - cron: "0 18 * * *"
   workflow_dispatch:
 
 jobs:
@@ -33,25 +34,19 @@ jobs:
         working-directory: src/bin/Release/net6.0
         run: pwsh ./playwright.ps1 install chromium
 
-      # ⬇️ Start a virtual X server and export DISPLAY for this job
-      - name: Start Xvfb
+      # ⬇️ Run in HEADLESS mode by passing the arg after `--`
+      - name: Run the scraper (headless, capture JSON)
         run: |
-          sudo apt-get update
-          sudo apt-get install -y xvfb
-          Xvfb :99 -screen 0 1280x720x24 > /dev/null 2>&1 &
-          echo "DISPLAY=:99" >> $GITHUB_ENV
-
-      # ⬇️ Run the scraper normally; Playwright will see DISPLAY and be happy
-      - name: Run the scraper (capture JSON)
-        run: |
-          dotnet run --project src/PakScraper.csproj > out.json
+          dotnet run --project src/PakScraper.csproj -- headless > out.json
           echo "Wrote scraper output to out.json"
 
+      # Deps to push data to Google Sheets
       - name: Install Python deps for Sheets
         run: |
           python3 -m pip install --upgrade pip
           python3 -m pip install google-api-python-client pandas
 
+      # Append results to Google Sheets
       - name: Push to Google Sheets
         env:
           GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}  # service account JSON (entire file)
@@ -74,9 +69,10 @@ jobs:
           data = []
           if raw:
             try:
-              j = json.loads(raw)
+              j = json.loads(raw)  # JSON array or single object
               data = j if isinstance(j, list) else [j]
             except json.JSONDecodeError:
+              # Fallback: NDJSON lines
               for line in raw.splitlines():
                 line=line.strip()
                 if not line: continue
@@ -89,6 +85,7 @@ jobs:
             print("No JSON records parsed from scraper output.", file=sys.stderr)
             sys.exit(0)
 
+          # --- Normalize to tabular ---
           df = pd.json_normalize(data)
           now = datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z"
           if "ingested_at" not in df.columns:
@@ -96,12 +93,14 @@ jobs:
           cols = list(df.columns)
           df = df[cols]
 
+          # --- Auth & write to Sheets ---
           creds = Credentials.from_service_account_info(
             json.loads(os.environ["GCP_SA_KEY"]),
             scopes=["https://www.googleapis.com/auth/spreadsheets"]
           )
           svc = build("sheets","v4",credentials=creds)
 
+          # First run: write header + rows. Later: rows only.
           values = [cols] + df.fillna("").astype(str).values.tolist()
           read = svc.spreadsheets().values().get(
             spreadsheetId=os.environ["SHEET_ID"],

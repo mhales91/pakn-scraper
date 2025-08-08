@@ -9,6 +9,7 @@ on:
 jobs:
   scrape:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -24,7 +25,7 @@ jobs:
       - name: Add Playwright CLI to PATH
         run: echo "$HOME/.dotnet/tools" >> $GITHUB_PATH
 
-      - name: Restore and build
+      - name: Restore & Build
         run: |
           dotnet restore src/PakScraper.csproj
           dotnet build src/PakScraper.csproj -c Release
@@ -33,24 +34,28 @@ jobs:
         working-directory: src/bin/Release/net6.0
         run: pwsh ./playwright.ps1 install chromium
 
-      # 👇 Run the scraper and capture console output to a file.
-      # If your app prints JSON array OR one-JSON-object-per-line, the next step will parse it.
+      # (Only needed if runner image ever lacks Xvfb)
+      - name: Ensure Xvfb is available
+        run: sudo apt-get update && sudo apt-get install -y xvfb
+
+      # Run scraper under a virtual display so headed Chromium won't crash.
+      # If your app supports a headless flag, you could use that instead.
       - name: Run the scraper (capture JSON)
         run: |
-          dotnet run --project src/PakScraper.csproj > out.json
+          xvfb-run -a dotnet run --project src/PakScraper.csproj > out.json
           echo "Wrote scraper output to out.json"
 
-      # 👇 Install Python deps used to write to Google Sheets
+      # Deps to push data to Google Sheets
       - name: Install Python deps for Sheets
         run: |
           python3 -m pip install --upgrade pip
           python3 -m pip install google-api-python-client pandas
 
-      # 👇 Append results to Google Sheets
+      # Append results to Google Sheets
       - name: Push to Google Sheets
         env:
-          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}  # your service account JSON (entire file content)
-          SHEET_ID: ${{ secrets.SHEET_ID }}      # spreadsheet ID from the URL
+          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}  # Service account JSON (entire file content)
+          SHEET_ID: ${{ secrets.SHEET_ID }}      # Spreadsheet ID from the URL
           SHEET_TAB: ${{ secrets.SHEET_TAB }}    # e.g., Sheet1
         run: |
           python3 - << 'PY'
@@ -68,10 +73,12 @@ jobs:
 
           data = []
           if raw:
+            # Try JSON array/object
             try:
               j = json.loads(raw)
               data = j if isinstance(j, list) else [j]
             except json.JSONDecodeError:
+              # Fallback: NDJSON (one JSON object per line)
               for line in raw.splitlines():
                 line=line.strip()
                 if not line: continue
@@ -84,6 +91,7 @@ jobs:
             print("No JSON records parsed from scraper output.", file=sys.stderr)
             sys.exit(0)
 
+          # --- Normalize to tabular ---
           df = pd.json_normalize(data)
           now = datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z"
           if "ingested_at" not in df.columns:
@@ -91,13 +99,14 @@ jobs:
           cols = list(df.columns)
           df = df[cols]
 
+          # --- Auth & write to Sheets ---
           creds = Credentials.from_service_account_info(
             json.loads(os.environ["GCP_SA_KEY"]),
             scopes=["https://www.googleapis.com/auth/spreadsheets"]
           )
           svc = build("sheets","v4",credentials=creds)
 
-          # header + rows (append header only if sheet is empty)
+          # Append header on first run; thereafter rows only
           values = [cols] + df.fillna("").astype(str).values.tolist()
           read = svc.spreadsheets().values().get(
             spreadsheetId=os.environ["SHEET_ID"],

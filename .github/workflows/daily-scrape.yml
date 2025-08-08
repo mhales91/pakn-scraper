@@ -34,7 +34,19 @@ jobs:
         working-directory: src/bin/Release/net6.0
         run: pwsh ./playwright.ps1 install chromium
 
-      # ⬇️ Run in HEADLESS mode by passing the arg after `--`
+      # ✅ This starts Xvfb and exports DISPLAY for you
+      - name: Ensure Playwright deps & Xvfb
+        uses: microsoft/playwright-github-action@v1
+        with:
+          xvfb: true
+
+      # (debug) prove we’re using the right workflow and have DISPLAY
+      - name: Debug mark
+        run: |
+          echo "HIT THE RIGHT WORKFLOW ✅"
+          echo "DISPLAY is: ${DISPLAY:-<unset>}"
+
+      # Run in headless mode (arg after `--` goes to your app)
       - name: Run the scraper (headless, capture JSON)
         run: |
           dotnet run --project src/PakScraper.csproj -- headless > out.json
@@ -63,16 +75,14 @@ jobs:
           try:
             raw = open("out.json","r",encoding="utf-8").read().strip()
           except FileNotFoundError:
-            print("out.json not found", file=sys.stderr)
-            sys.exit(1)
+            print("out.json not found", file=sys.stderr); sys.exit(1)
 
           data = []
           if raw:
             try:
-              j = json.loads(raw)  # JSON array or single object
+              j = json.loads(raw)  # array or single object
               data = j if isinstance(j, list) else [j]
             except json.JSONDecodeError:
-              # Fallback: NDJSON lines
               for line in raw.splitlines():
                 line=line.strip()
                 if not line: continue
@@ -100,7 +110,6 @@ jobs:
           )
           svc = build("sheets","v4",credentials=creds)
 
-          # First run: write header + rows. Later: rows only.
           values = [cols] + df.fillna("").astype(str).values.tolist()
           read = svc.spreadsheets().values().get(
             spreadsheetId=os.environ["SHEET_ID"],

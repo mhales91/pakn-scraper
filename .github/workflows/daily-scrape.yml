@@ -14,6 +14,11 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Debug mark
+        run: |
+          echo "HIT THE RIGHT WORKFLOW ✅"
+          echo "DISPLAY is: ${DISPLAY:-<unset>}"
+
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
@@ -35,35 +40,28 @@ jobs:
         working-directory: src/bin/Release/net6.0
         run: pwsh ./playwright.ps1 install chromium
 
-      # ✅ Install Xvfb and start a virtual display. No deprecated actions.
+      # ---- Install Xvfb (virtual display) ----
       - name: Install Xvfb
         run: |
           set -euxo pipefail
           sudo apt-get update
           sudo apt-get install -y xvfb
 
-      # (debug) prove we’re in the right workflow and show DISPLAY
-      - name: Debug mark
-        run: |
-          echo "HIT THE RIGHT WORKFLOW ✅"
-          echo "DISPLAY is: ${DISPLAY:-<unset>}"
-
-      # ✅ Run Playwright under Xvfb so headed Chromium works in CI
-      # If your app *still* ignores headless, this will handle it anyway.
+      # ---- Run scraper under Xvfb (no code changes needed) ----
       - name: Run the scraper (capture JSON)
         run: |
           set -euxo pipefail
           xvfb-run -a -s "-screen 0 1280x720x24" \
-            dotnet run --project src/PakScraper.csproj > out.json
+            dotnet run --project src/PakScraper.csproj -- headless > out.json
           echo "Wrote scraper output to out.json"
 
-      # Deps to push data to Google Sheets
+      # ---- Deps to push data to Google Sheets ----
       - name: Install Python deps for Sheets
         run: |
           python3 -m pip install --upgrade pip
           python3 -m pip install google-api-python-client pandas
 
-      # Append results to Google Sheets
+      # ---- Append results to Google Sheets ----
       - name: Push to Google Sheets
         env:
           GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}  # service account JSON (entire file)
@@ -78,57 +76,62 @@ jobs:
 
           # --- Load output ---
           try:
-            raw = open("out.json","r",encoding="utf-8").read().strip()
+              raw = open("out.json","r",encoding="utf-8").read().strip()
           except FileNotFoundError:
-            print("out.json not found", file=sys.stderr); sys.exit(1)
+              print("out.json not found", file=sys.stderr); sys.exit(1)
 
           data = []
           if raw:
-            try:
-              j = json.loads(raw)  # array or single object
-              data = j if isinstance(j, list) else [j]
-            except json.JSONDecodeError:
-              for line in raw.splitlines():
-                line=line.strip()
-                if not line: continue
-                try:
-                  data.append(json.loads(line))
-                except Exception:
-                  pass
+              # Try JSON array/object first
+              try:
+                  j = json.loads(raw)
+                  data = j if isinstance(j, list) else [j]
+              except json.JSONDecodeError:
+                  # Fallback: NDJSON (one object per line)
+                  for line in raw.splitlines():
+                      line=line.strip()
+                      if not line: continue
+                      try:
+                          data.append(json.loads(line))
+                      except Exception:
+                          pass
 
           if not data:
-            print("No JSON records parsed from scraper output.", file=sys.stderr)
-            sys.exit(0)
+              print("No JSON records parsed from scraper output.", file=sys.stderr)
+              sys.exit(0)
 
+          # --- Normalize to tabular ---
           df = pd.json_normalize(data)
           now = datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z"
           if "ingested_at" not in df.columns:
-            df["ingested_at"] = now
+              df["ingested_at"] = now
           cols = list(df.columns)
           df = df[cols]
 
+          # --- Auth & write to Sheets ---
           creds = Credentials.from_service_account_info(
-            json.loads(os.environ["GCP_SA_KEY"]),
-            scopes=["https://www.googleapis.com/auth/spreadsheets"]
+              json.loads(os.environ["GCP_SA_KEY"]),
+              scopes=["https://www.googleapis.com/auth/spreadsheets"]
           )
           svc = build("sheets","v4",credentials=creds)
 
+          # Header on first run, rows thereafter
           values = [cols] + df.fillna("").astype(str).values.tolist()
           read = svc.spreadsheets().values().get(
-            spreadsheetId=os.environ["SHEET_ID"],
-            range=f"{os.environ.get('SHEET_TAB','Sheet1')}!A1:A1"
+              spreadsheetId=os.environ["SHEET_ID"],
+              range=f"{os.environ.get('SHEET_TAB','Sheet1')}!A1:A1"
           ).execute()
           has_any = 'values' in read
           if has_any:
-            values = values[1:]
+              values = values[1:]
 
           if values:
-            svc.spreadsheets().values().append(
-              spreadsheetId=os.environ["SHEET_ID"],
-              range=f"{os.environ.get('SHEET_TAB','Sheet1')}!A1",
-              valueInputOption="RAW",
-              insertDataOption="INSERT_ROWS",
-              body={"values": values}
-            ).execute()
+              svc.spreadsheets().values().append(
+                  spreadsheetId=os.environ["SHEET_ID"],
+                  range=f"{os.environ.get('SHEET_TAB','Sheet1')}!A1",
+                  valueInputOption="RAW",
+                  insertDataOption="INSERT_ROWS",
+                  body={"values": values}
+              ).execute()
           print(f"Appended {len(values)} row(s)")
           PY

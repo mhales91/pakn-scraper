@@ -1,0 +1,42 @@
+name: Daily Pak'nSave Scrape
+
+on:
+  schedule:
+    # Runs at 18:00 UTC each day; that's 6:00 AM NZST and 7:00 AM NZDT.
+    - cron: "0 18 * * *"
+  workflow_dispatch:
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '6.0.x'
+
+      - name: Install Playwright CLI
+        run: dotnet tool install --global Microsoft.Playwright.CLI
+
+      - name: Add Playwright CLI to PATH
+        run: echo "$HOME/.dotnet/tools" >> $GITHUB_PATH
+
+      - name: Restore and build
+        run: |
+          dotnet restore src/PakScraper.csproj
+          dotnet build src/PakScraper.csproj -c Release
+
+      - name: Install Chromium for Playwright
+        working-directory: src/bin/Release/net6.0
+        run: pwsh ./playwright.ps1 install chromium
+
+      - name: Run the scraper
+        env:
+          COSMOS_ENDPOINT: ${{ secrets.COSMOS_ENDPOINT }}
+          COSMOS_KEY: ${{ secrets.COSMOS_KEY }}
+          GEOLOCATION_LAT: "-41.21"    # change if needed
+          GEOLOCATION_LONG: "174.91"   # change if needed
+        run: dotnet run --project src/PakScraper.csproj

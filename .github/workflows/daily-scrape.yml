@@ -1,8 +1,8 @@
-name: Daily Pak'nSave Scrape
+name: Daily Pak'nSave Scrape → Google Sheets
 
 on:
   schedule:
-    # Runs at 18:00 UTC each day; that's 6:00 AM NZST and 7:00 AM NZDT.
+    # 18:00 UTC daily = 6:00 AM NZST / 7:00 AM NZDT
     - cron: "0 18 * * *"
   workflow_dispatch:
 
@@ -33,10 +33,87 @@ jobs:
         working-directory: src/bin/Release/net6.0
         run: pwsh ./playwright.ps1 install chromium
 
-      - name: Run the scraper
+      # 👇 Run the scraper and capture console output to a file.
+      # If your app prints JSON array OR one-JSON-object-per-line, the next step will parse it.
+      - name: Run the scraper (capture JSON)
+        run: |
+          dotnet run --project src/PakScraper.csproj > out.json
+          echo "Wrote scraper output to out.json"
+
+      # 👇 Install Python deps used to write to Google Sheets
+      - name: Install Python deps for Sheets
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install google-api-python-client pandas
+
+      # 👇 Append results to Google Sheets
+      - name: Push to Google Sheets
         env:
-          COSMOS_ENDPOINT: ${{ secrets.COSMOS_ENDPOINT }}
-          COSMOS_KEY: ${{ secrets.COSMOS_KEY }}
-          GEOLOCATION_LAT: "-41.21"    # change if needed
-          GEOLOCATION_LONG: "174.91"   # change if needed
-        run: dotnet run --project src/PakScraper.csproj
+          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}  # your service account JSON (entire file content)
+          SHEET_ID: ${{ secrets.SHEET_ID }}      # spreadsheet ID from the URL
+          SHEET_TAB: ${{ secrets.SHEET_TAB }}    # e.g., Sheet1
+        run: |
+          python3 - << 'PY'
+          import os, json, sys, datetime
+          import pandas as pd
+          from google.oauth2.service_account import Credentials
+          from googleapiclient.discovery import build
+
+          # --- Load output ---
+          try:
+            raw = open("out.json","r",encoding="utf-8").read().strip()
+          except FileNotFoundError:
+            print("out.json not found", file=sys.stderr)
+            sys.exit(1)
+
+          data = []
+          if raw:
+            try:
+              j = json.loads(raw)
+              data = j if isinstance(j, list) else [j]
+            except json.JSONDecodeError:
+              for line in raw.splitlines():
+                line=line.strip()
+                if not line: continue
+                try:
+                  data.append(json.loads(line))
+                except Exception:
+                  pass
+
+          if not data:
+            print("No JSON records parsed from scraper output.", file=sys.stderr)
+            sys.exit(0)
+
+          df = pd.json_normalize(data)
+          now = datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z"
+          if "ingested_at" not in df.columns:
+            df["ingested_at"] = now
+          cols = list(df.columns)
+          df = df[cols]
+
+          creds = Credentials.from_service_account_info(
+            json.loads(os.environ["GCP_SA_KEY"]),
+            scopes=["https://www.googleapis.com/auth/spreadsheets"]
+          )
+          svc = build("sheets","v4",credentials=creds)
+
+          # header + rows (append header only if sheet is empty)
+          values = [cols] + df.fillna("").astype(str).values.tolist()
+          read = svc.spreadsheets().values().get(
+            spreadsheetId=os.environ["SHEET_ID"],
+            range=f"{os.environ.get('SHEET_TAB','Sheet1')}!A1:A1"
+          ).execute()
+          has_any = 'values' in read
+          if has_any:
+            values = values[1:]
+
+          if values:
+            svc.spreadsheets().values().append(
+              spreadsheetId=os.environ["SHEET_ID"],
+              range=f"{os.environ.get('SHEET_TAB','Sheet1')}!A1",
+              valueInputOption="RAW",
+              insertDataOption="INSERT_ROWS",
+              body={"values": values}
+            ).execute()
+          print(f"Appended {len(values)} row(s)")
+          PY

@@ -1,76 +1,91 @@
-name: Daily Pak'nSave Scrape → Google Sheets
+name: scrape
 
 on:
-  schedule:
-    - cron: "0 18 * * *"   # daily 18:00 UTC
   workflow_dispatch:
+  schedule:
+    - cron: "0 * * * *" # hourly; tweak as you like
 
 jobs:
   scrape:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Echo env
+        run: |
+          echo "HIT THE RIGHT WORKFLOW ✅"
+          echo "DISPLAY is: ${DISPLAY:-<unset>}"
+
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: '6.0.x'
+          dotnet-version: 6.0.x
+          cache: false
 
       - name: Install Playwright CLI
         run: dotnet tool install --global Microsoft.Playwright.CLI
 
-      - name: Add Playwright CLI to PATH
-        run: echo "$HOME/.dotnet/tools" >> "$GITHUB_PATH"
+      - name: Add dotnet tools to PATH
+        run: echo "$HOME/.dotnet/tools" >> $GITHUB_PATH
 
       - name: Restore & Build
         run: |
           set -euxo pipefail
           dotnet restore src/PakScraper.csproj
-          dotnet build   src/PakScraper.csproj -c Release
+          dotnet build src/PakScraper.csproj -c Release
 
-      - name: Install Chromium for Playwright
-        working-directory: src/bin/Release/net6.0
+      - name: Install browsers for Playwright
+        shell: bash
         run: pwsh ./playwright.ps1 install chromium
 
-      - name: Install Xvfb
+      - name: Ensure xvfb
         run: |
+          set -euxo pipefail
           sudo apt-get update
           sudo apt-get install -y xvfb
 
-      # ---------------- RUN SCRAPER ----------------
+      # --- RUN SCRAPER + CAPTURE EVERYTHING ---
       - name: Run scraper and capture outputs
+        id: run_scraper
+        shell: bash
         run: |
           set -euxo pipefail
 
-          # Run under virtual display. Redirect:
-          #  - JSON/stdout → out.json
-          #  - raw stdout  → out.stdout.txt
-          #  - stderr      → out.stderr.txt
-          # If your app writes JSON to a file instead of stdout, copy it to out.json afterwards.
+          # Run app under Xvfb; capture stdout to out.json & out.stdout.txt, stderr to out.stderr.txt
           xvfb-run -a -s "-screen 0 1280x720x24" \
-            bash -lc 'dotnet run --project src/PakScraper.csproj -- headless \
-              > out.json 1> out.stdout.txt 2> out.stderr.txt || true'
-
-          echo "===== tail stdout ====="
-          tail -n 120 out.stdout.txt || true
-          echo "===== tail stderr ====="
-          tail -n 120 out.stderr.txt || true
+            dotnet run --project src/PakScraper.csproj -- headless \
+            2> out.stderr.txt | tee out.json | tee out.stdout.txt > /dev/null
 
           echo "===== file sizes ====="
           for f in out.json out.stdout.txt out.stderr.txt; do
             if [ -f "$f" ]; then
-              echo -n "$f: "; wc -c "$f"
+              printf "%s: " "$f"; wc -c "$f"
             else
               echo "$f: <missing>"
             fi
           done
 
-          echo "===== workspace listing ====="
-          ls -la
+          echo "===== first 50 lines of out.json ====="
+          head -n 50 out.json || true
 
-      # Always upload so you can download even when JSON is empty
+          echo "===== any JSON files in repo ====="
+          find . -type f -name "*.json" -printf "%p (%s bytes)\n" | sort || true
+
+      - name: Check out.json non-empty
+        id: check_out_json
+        shell: bash
+        run: |
+          if [ -s out.json ]; then
+            echo "nonempty=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "nonempty=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Always upload so you can inspect results even on failure
       - name: Upload scrape artifacts
         if: always()
         uses: actions/upload-artifact@v4
@@ -80,73 +95,83 @@ jobs:
             out.json
             out.stdout.txt
             out.stderr.txt
+            **/*.json
           if-no-files-found: warn
           retention-days: 7
 
-      # ---------------- PUSH TO SHEETS ----------------
-      - name: Install Python deps
-        run: |
-          python3 -m pip install --upgrade pip
-          python3 -m pip install google-api-python-client pandas
-
-      - name: Push to Google Sheets (only if JSON exists & non-empty)
-        if: ${{ hashFiles('out.json') != '' }}
+      # --- PUSH TO SHEETS (only if out.json exists AND has bytes) ---
+      - name: Push to Google Sheets
+        if: steps.check_out_json.outputs.nonempty == 'true'
         env:
           GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
           SHEET_ID:   ${{ secrets.SHEET_ID }}
           SHEET_TAB:  ${{ secrets.SHEET_TAB }}
+        shell: bash
         run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install google-api-python-client pandas
+
           python3 - << 'PY'
           import os, json, sys, datetime
           import pandas as pd
           from google.oauth2.service_account import Credentials
           from googleapiclient.discovery import build
 
-          raw = open("out.json","r",encoding="utf-8").read().strip()
+          # --- Load output ---
+          try:
+              raw = open("out.json","r",encoding="utf-8").read().strip()
+          except FileNotFoundError:
+              print("out.json not found", file=sys.stderr); sys.exit(1)
+
           data = []
           if raw:
+              # Try JSON array/object first
               try:
                   j = json.loads(raw)
                   data = j if isinstance(j, list) else [j]
               except json.JSONDecodeError:
+                  # Fallback: NDJSON (one object per line)
                   for line in raw.splitlines():
                       line=line.strip()
                       if not line: continue
-                      try: data.append(json.loads(line))
-                      except: pass
+                      try:
+                          data.append(json.loads(line))
+                      except Exception:
+                          pass
 
           if not data:
-              print("No JSON records parsed from scraper output.")
+              print("No JSON records parsed from scraper output.", file=sys.stderr)
               sys.exit(0)
 
+          # --- Normalize to tabular ---
           df = pd.json_normalize(data)
-          now = datetime.datetime.utcnow().isoformat(timespec="seconds")+"Z"
+          now = datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z"
           if "ingested_at" not in df.columns:
               df["ingested_at"] = now
           cols = list(df.columns)
           df = df[cols]
 
+          # --- Auth & write to Sheets ---
           creds = Credentials.from_service_account_info(
               json.loads(os.environ["GCP_SA_KEY"]),
               scopes=["https://www.googleapis.com/auth/spreadsheets"]
           )
           svc = build("sheets","v4",credentials=creds)
-          tab = os.environ.get("SHEET_TAB","Sheet1")
-
-          read = svc.spreadsheets().values().get(
-              spreadsheetId=os.environ["SHEET_ID"],
-              range=f"{tab}!A1:A1"
-          ).execute()
-          has_any = 'values' in read
 
           values = [cols] + df.fillna("").astype(str).values.tolist()
-          if has_any:
+
+          # If sheet already has any data, skip header
+          read = svc.spreadsheets().values().get(
+              spreadsheetId=os.environ["SHEET_ID"],
+              range=f"{os.environ.get('SHEET_TAB','Sheet1')}!A1:A1"
+          ).execute()
+          if 'values' in read:
               values = values[1:]
 
           if values:
               svc.spreadsheets().values().append(
                   spreadsheetId=os.environ["SHEET_ID"],
-                  range=f"{tab}!A1",
+                  range=f"{os.environ.get('SHEET_TAB','Sheet1')}!A1",
                   valueInputOption="RAW",
                   insertDataOption="INSERT_ROWS",
                   body={"values": values}

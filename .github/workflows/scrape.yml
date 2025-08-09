@@ -4,7 +4,7 @@ name: scrape
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 1 * * *"   # daily at 01:00 UTC
+    - cron: "0 1 * * *"
 
 jobs:
   scrape:
@@ -34,33 +34,40 @@ jobs:
         shell: pwsh
         run: bin/Debug/net6.0/playwright.ps1 install chromium
 
-      # --- Diagnostics to prove where we are and what files exist
-      - name: List important paths
+      - name: Show tree
         run: |
-          echo "PWD = $(pwd)"
-          echo "=== src ==="
-          ls -la src
-          echo "=== bin/Debug/net6.0 ==="
-          ls -la src/bin/Debug/net6.0 || true
+          echo "PWD=$(pwd)"
+          tree -a -L 2 || true
 
-      # --- Copy Urls.txt to the build output where the app likely reads from
       - name: Ensure Urls.txt is in runtime folder
         run: |
           test -f src/Urls.txt || (echo "src/Urls.txt missing!" && exit 1)
           cp -f src/Urls.txt src/bin/Debug/net6.0/Urls.txt
-          echo "After copy:"
-          ls -la src/bin/Debug/net6.0 | grep -i Urls.txt || true
+          echo "---- head src/Urls.txt ----"; head -n 40 src/Urls.txt || true
+          echo "---- head bin/Debug/net6.0/Urls.txt ----"; head -n 40 src/bin/Debug/net6.0/Urls.txt || true
 
-      # Run the scraper; capture stdout/stderr to files at repo root
-      - name: Run scraper (dry run)
+      - name: Install xvfb (safety for headless runs)
+        run: sudo apt-get update && sudo apt-get install -y xvfb
+
+      - name: Run scraper (dry run) under Xvfb
         working-directory: src
+        env:
+          # Make failures obvious in the console but still write files
+          DOTNET_CLI_TELEMETRY_OPTOUT: 1
         run: |
           set -o pipefail
-          { dotnet run ; } \
-            >  ../out.stdout.txt \
-            2> ../out.stderr.txt
+          echo "Starting dotnet run at $(date -u)"
+          # capture exit code so we can still dump logs after
+          xvfb-run -a -s "-screen 0 1280x720x24" \
+            bash -lc '{ dotnet run ; } > ../out.stdout.txt 2> ../out.stderr.txt'; EC=$?
+          echo "dotnet run exit code: $EC"
+          # Always print stderr and the tail of stdout for debugging
+          echo "-------- out.stderr.txt --------"; (sed -n '1,400p' ../out.stderr.txt || true)
+          echo "-------- tail out.stdout.txt --------"; (tail -n 200 ../out.stdout.txt || true)
+          exit $EC
 
       - name: Upload outputs
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: scrape-outputs

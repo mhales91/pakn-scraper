@@ -1,9 +1,10 @@
+# .github/workflows/scrape.yml
 name: scrape
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 * * * *"  # run hourly (adjust as needed)
+    - cron: "0 1 * * *" # daily at 01:00 UTC - tweak as you like
 
 jobs:
   scrape:
@@ -11,146 +12,50 @@ jobs:
     permissions:
       contents: read
 
-    env:
-      # Where Playwright downloads browsers (default is fine, set explicitly for clarity)
-      PLAYWRIGHT_BROWSERS_PATH: ~/.cache/ms-playwright
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup .NET 6 SDK (and LTS runtime)
+      - name: Setup .NET 6 SDK
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: 6.0.x
-          cache: false
 
-      - name: Install Playwright CLI (dotnet tool)
-        run: dotnet tool install --global Microsoft.Playwright.CLI
+      # Everything runs from ./src so the app finds Urls.txt as per README
+      - name: Restore packages
+        working-directory: src
+        run: dotnet restore
 
-      - name: Add dotnet tools to PATH
-        run: echo "$HOME/.dotnet/tools" >> $GITHUB_PATH
+      - name: Build (Debug) — required so playwright.ps1 exists in bin/Debug/net6.0
+        working-directory: src
+        run: dotnet build -c Debug
 
-      - name: Restore & Build
+      - name: Install Playwright Chromium (per README)
+        working-directory: src
+        shell: pwsh
+        run: bin/Debug/net6.0/playwright.ps1 install chromium
+
+      # Optional: sanity check that Urls.txt is present
+      - name: Check Urls.txt
+        working-directory: src
         run: |
-          set -euxo pipefail
-          dotnet restore src/PakScraper.csproj
-          dotnet build src/PakScraper.csproj -c Release
+          test -f Urls.txt && echo "Found Urls.txt" || (echo "Urls.txt missing!" && exit 1)
 
-      - name: Install Playwright Chromium
-        run: playwright install chromium
-
-      - name: Install Xvfb
+      # Run the scraper. It prints a table to stdout (not JSON).
+      - name: Run scraper (dry run)
+        working-directory: src
         run: |
-          set -euxo pipefail
-          sudo apt-get update
-          sudo apt-get install -y xvfb
+          set -o pipefail
+          { dotnet run ; } \
+            >  ../out.stdout.txt \
+            2> ../out.stderr.txt
 
-      - name: Run scraper (headless via xvfb)
-        run: |
-          set -euxo pipefail
-          # Run your app; it should print JSON to stdout.
-          # We capture stdout to out.json (and also to out.stdout.txt),
-          # and stderr to out.stderr.txt for debugging.
-          xvfb-run -a -s "-screen 0 1280x720x24" \
-            dotnet run --project src/PakScraper.csproj -- headless \
-            | tee out.json > out.stdout.txt 2> out.stderr.txt
-          echo "Wrote scraper output to out.json"
-
-      - name: Append results to Google Sheets
-        env:
-          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }} # JSON service account key
-          SHEET_ID: ${{ secrets.SHEET_ID }}     # Spreadsheet ID
-          SHEET_TAB: ${{ secrets.SHEET_TAB }}   # Optional: sheet/tab name (defaults to 'Sheet1')
-        run: |
-          python3 -m pip install --upgrade pip
-          python3 -m pip install google-api-python-client pandas
-          python3 - << 'PY'
-          import os, json, sys, datetime
-          import pandas as pd
-          from google.oauth2.service_account import Credentials
-          from googleapiclient.discovery import build
-
-          # --- Load output ---
-          try:
-              raw = open("out.json","r",encoding="utf-8").read().strip()
-          except FileNotFoundError:
-              print("out.json not found", file=sys.stderr); sys.exit(0)
-
-          data = []
-          if raw:
-              try:
-                  j = json.loads(raw)
-                  data = j if isinstance(j, list) else [j]
-              except json.JSONDecodeError:
-                  # Fallback: NDJSON (one JSON object per line)
-                  for line in raw.splitlines():
-                      line=line.strip()
-                      if not line: continue
-                      try:
-                          data.append(json.loads(line))
-                      except Exception:
-                          pass
-
-          if not data:
-              print("No JSON records parsed from scraper output.", file=sys.stderr)
-              sys.exit(0)
-
-          # --- Normalize to tabular ---
-          df = pd.json_normalize(data)
-          now = datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z"
-          if "ingested_at" not in df.columns:
-              df["ingested_at"] = now
-          cols = list(df.columns)
-          df = df[cols]
-
-          # --- Auth & write to Sheets ---
-          sa_raw = os.environ.get("GCP_SA_KEY")
-          sheet_id = os.environ.get("SHEET_ID")
-          sheet_tab = os.environ.get("SHEET_TAB") or "Sheet1"
-          if not sa_raw or not sheet_id:
-              print("Missing GCP_SA_KEY or SHEET_ID; skipping Sheets append.", file=sys.stderr)
-              sys.exit(0)
-
-          creds = Credentials.from_service_account_info(
-              json.loads(sa_raw),
-              scopes=["https://www.googleapis.com/auth/spreadsheets"]
-          )
-          svc = build("sheets","v4",credentials=creds)
-
-          # Header on first run, rows thereafter
-          values = [cols] + df.fillna("").astype(str).values.tolist()
-          read = svc.spreadsheets().values().get(
-              spreadsheetId=sheet_id,
-              range=f"{sheet_tab}!A1:A1"
-          ).execute()
-          has_any = 'values' in read
-          if has_any:
-              values = values[1:]
-
-          if values:
-              svc.spreadsheets().values().append(
-                  spreadsheetId=sheet_id,
-                  range=f"{sheet_tab}!A1",
-                  valueInputOption="RAW",
-                  insertDataOption="INSERT_ROWS",
-                  body={"values": values}
-              ).execute()
-          print(f"Appended {len(values)} row(s)")
-          PY
-
-      - name: Upload outputs (always)
-        if: always()
+      - name: Upload outputs
         uses: actions/upload-artifact@v4
         with:
           name: scrape-outputs
           path: |
-            out.json
             out.stdout.txt
             out.stderr.txt
-            **/*.json
+            src/Urls.txt
           if-no-files-found: warn
-          retention-days: 7
-          compression-level: 6
-          overwrite: false
-          include-hidden-files: false

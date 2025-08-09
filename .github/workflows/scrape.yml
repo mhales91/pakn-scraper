@@ -1,10 +1,9 @@
-# .github/workflows/scrape.yml
 name: scrape
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 1 * * *"  # daily 01:00 UTC
+    - cron: "0 1 * * *" # daily at 01:00 UTC
 
 jobs:
   scrape:
@@ -25,54 +24,54 @@ jobs:
         working-directory: src
         run: dotnet restore
 
-      - name: Build (Debug) so playwright.ps1 exists
+      - name: Build (Debug)
         working-directory: src
         run: dotnet build -c Debug
 
-      - name: Install Playwright Chromium (per README)
+      - name: Install Playwright Chromium
         working-directory: src
         shell: pwsh
         run: bin/Debug/net6.0/playwright.ps1 install chromium
 
-      # 👇 Force a NZ location so the site picks a nearby store (avoids IP geolocation)
-      - name: Write appsettings.json (NZ store coords)
-        run: |
-          mkdir -p src
-          cat > src/appsettings.json <<'JSON'
-          {
-            "GEOLOCATION_LAT": "–37.74",   // TGA
-            "GEOLOCATION_LONG":  "176.06"
-          }
-          JSON
-          echo "---- appsettings.json ----"
-          cat src/appsettings.json
-
-      - name: Ensure Urls.txt is in runtime folder
-        run: |
-          test -f src/Urls.txt || (echo "src/Urls.txt missing!" && exit 1)
-          cp -f src/Urls.txt src/bin/Debug/net6.0/Urls.txt
-          echo "---- head src/Urls.txt ----"; head -n 40 src/Urls.txt || true
-          echo "---- head bin/Debug/net6.0/Urls.txt ----"; head -n 40 src/bin/Debug/net6.0/Urls.txt || true
-
-      - name: Install xvfb
-        run: sudo apt-get update && sudo apt-get install -y xvfb
-
-      - name: Run scraper (dry run) under Xvfb
+      - name: Verify Urls.txt exists
         working-directory: src
-        env:
-          DOTNET_CLI_TELEMETRY_OPTOUT: 1
+        run: |
+          set -e
+          test -f Urls.txt && echo "Found src/Urls.txt" || (echo "src/Urls.txt missing!" && exit 1)
+          head -n 3 Urls.txt || true
+
+      # Create appsettings.json as ONE line and copy both files into the runtime folder
+      - name: Stage runtime inputs (Urls.txt + appsettings.json) to bin/Debug/net6.0
+        working-directory: src
+        run: |
+          RUNTIME_DIR="bin/Debug/net6.0"
+          mkdir -p "$RUNTIME_DIR"
+
+          # Write single-line JSON (no BOM, no trailing comma/newline)
+          printf '{"GEOLOCATION_LAT":"-37.73953","GEOLOCATION_LONG":"176.09528"}' > appsettings.json
+
+          # Show what we wrote
+          echo "appsettings.json content:"
+          cat appsettings.json
+
+          # Copy inputs into runtime dir (where the app reads from)
+          cp Urls.txt "$RUNTIME_DIR/Urls.txt"
+          cp appsettings.json "$RUNTIME_DIR/appsettings.json"
+
+          # List for sanity
+          echo "Runtime dir contents:"
+          ls -la "$RUNTIME_DIR"
+
+      - name: Run scraper (Debug, no rebuild)
+        working-directory: src
         run: |
           set -o pipefail
-          echo "Starting dotnet run at $(date -u)"
-          xvfb-run -a -s "-screen 0 1280x720x24" \
-            bash -lc '{ dotnet run ; } > ../out.stdout.txt 2> ../out.stderr.txt'; EC=$?
-          echo "dotnet run exit code: $EC"
-          echo "-------- out.stderr.txt --------"; (sed -n '1,400p' ../out.stderr.txt || true)
-          echo "-------- tail out.stdout.txt --------"; (tail -n 200 ../out.stdout.txt || true)
-          exit $EC
+          { dotnet run -c Debug --no-build; } \
+            >  ../out.stdout.txt \
+            2> ../out.stderr.txt
+          echo "Exit code: $?"
 
       - name: Upload outputs
-        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: scrape-outputs
@@ -81,4 +80,6 @@ jobs:
             out.stderr.txt
             src/Urls.txt
             src/appsettings.json
+            src/bin/Debug/net6.0/appsettings.json
+            src/bin/Debug/net6.0/Urls.txt
           if-no-files-found: warn

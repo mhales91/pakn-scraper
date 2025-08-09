@@ -17,6 +17,7 @@ jobs:
       - name: Debug mark
         run: |
           echo "HIT THE RIGHT WORKFLOW ✅"
+          echo "BRANCH: $GITHUB_REF / SHA: $GITHUB_SHA"
           echo "DISPLAY is: ${DISPLAY:-<unset>}"
 
       - name: Setup .NET
@@ -40,14 +41,16 @@ jobs:
         working-directory: src/bin/Release/net6.0
         run: pwsh ./playwright.ps1 install chromium
 
-      # ---- Install Xvfb (virtual display) ----
       - name: Install Xvfb
         run: |
           set -euxo pipefail
           sudo apt-get update
           sudo apt-get install -y xvfb
 
-      # ---- Run scraper under Xvfb (no code changes needed) ----
+      # If your scraper needs location, uncomment & set these:
+      # env:
+      #   GEOLOCATION_LAT: "-37.69"
+      #   GEOLOCATION_LONG: "176.17"
       - name: Run the scraper (capture JSON)
         run: |
           set -euxo pipefail
@@ -55,13 +58,31 @@ jobs:
             dotnet run --project src/PakScraper.csproj -- headless > out.json
           echo "Wrote scraper output to out.json"
 
-      # ---- Deps to push data to Google Sheets ----
+      # --- NEW: inspect and save raw output so we can debug data shape ---
+      - name: Inspect scraper output
+        if: always()
+        run: |
+          echo "Listing files (pwd=$(pwd))"
+          ls -la
+          echo "Top-level files:"
+          find . -maxdepth 2 -type f | sort
+          echo "out.json size (bytes):"
+          wc -c out.json || true
+          echo "First 120 lines of out.json:"
+          sed -n '1,120p' out.json || true
+
+      - name: Upload raw scraper output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scraper-raw
+          path: out.json
+
       - name: Install Python deps for Sheets
         run: |
           python3 -m pip install --upgrade pip
           python3 -m pip install google-api-python-client pandas
 
-      # ---- Append results to Google Sheets ----
       - name: Push to Google Sheets
         env:
           GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}  # service account JSON (entire file)

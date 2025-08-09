@@ -2,7 +2,8 @@ name: Daily Pak'nSave Scrape → Google Sheets
 
 on:
   schedule:
-    - cron: "0 18 * * *" # daily 18:00 UTC
+    # 18:00 UTC daily = 6:00 AM NZST / 7:00 AM NZDT
+    - cron: "0 18 * * *"
   workflow_dispatch:
 
 jobs:
@@ -13,12 +14,6 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Debug mark
-        run: |
-          echo "HIT THE RIGHT WORKFLOW ✅"
-          echo "BRANCH: $GITHUB_REF / SHA: $GITHUB_SHA"
-          echo "DISPLAY is: ${DISPLAY:-<unset>}"
-
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
@@ -28,7 +23,7 @@ jobs:
         run: dotnet tool install --global Microsoft.Playwright.CLI
 
       - name: Add Playwright CLI to PATH
-        run: echo "$HOME/.dotnet/tools" >> $GITHUB_PATH
+        run: echo "$HOME/.dotnet/tools" >> "$GITHUB_PATH"
 
       - name: Restore & Build
         run: |
@@ -46,58 +41,79 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y xvfb
 
-      # We capture STDOUT to out.stdout.txt for diagnostics,
-      # but we DO NOT overwrite out.json anymore (in case your app writes its own JSON file).
-      - name: Run the scraper
+      # ---------- RUN SCRAPER ----------
+      - name: Run the scraper (headless) and capture outputs
+        # Add your scraper env here if it needs them (uncomment & set secrets)
+        # env:
+        #   COSMOS_ENDPOINT: ${{ secrets.COSMOS_ENDPOINT }}
+        #   COSMOS_KEY: ${{ secrets.COSMOS_KEY }}
+        #   GEOLOCATION_LAT: "-41.21"
+        #   GEOLOCATION_LONG: "174.91"
         run: |
           set -euxo pipefail
+
+          # Run under virtual display, force headless arg to your app
           xvfb-run -a -s "-screen 0 1280x720x24" \
-            dotnet run --project src/PakScraper.csproj -- headless | tee out.stdout.txt
-          echo "Scraper finished."
+            dotnet run --project src/PakScraper.csproj -- headless \
+            1> out.stdout.txt 2> out.stderr.txt
 
-      # Discover the most likely JSON file produced by the run (newest *.json anywhere under repo)
-      - name: Discover JSON output
-        id: discover
-        run: |
-          set -euxo pipefail
-          echo "Listing files produced:"
-          find . -maxdepth 3 -type f -printf '%TY-%Tm-%Td %TH:%TM:%TS %p\n' | sort -r | head -n 80
+          # If your app writes JSON to stdout, adapt the command above to:
+          #   ... -- headless > out.json 1> out.stdout.txt 2> out.stderr.txt
+          # and/or change your app to write JSON to a file.
+          # If your app already writes the JSON file, copy it here:
+          #   cp path/to/your-json-file.json out.json
 
-          # Find newest JSON file (repo root or within 3 levels)
-          JSON_FILE="$(find . -maxdepth 3 -type f -name '*.json' -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -n1 | awk '{print substr($0, index($0,$2))}')"
-          if [ -n "${JSON_FILE}" ] && [ -f "${JSON_FILE}" ]; then
-            echo "Found JSON candidate: ${JSON_FILE}"
-            echo "SCRAPER_JSON=${JSON_FILE}" >> "$GITHUB_ENV"
-          else
-            echo "No .json file found. We'll try to parse stdout instead."
-            echo "SCRAPER_JSON=" >> "$GITHUB_ENV"
+          # If out.json wasn't created by your app, try grabbing JSON from stdout
+          if [ ! -s out.json ] && grep -q '{' out.stdout.txt; then
+            # Attempt crude extraction (best if stdout is only JSON)
+            cp out.stdout.txt out.json || true
           fi
 
-          echo "out.stdout.txt size:"
-          wc -c out.stdout.txt || true
+          echo "===== stdout (last 120 lines) ====="
+          tail -n 120 out.stdout.txt || true
+          echo "===== stderr (last 120 lines) ====="
+          tail -n 120 out.stderr.txt || true
 
-          echo "First 120 lines of out.stdout.txt:"
-          sed -n '1,120p' out.stdout.txt || true
+          echo "===== file sizes ====="
+          for f in out.json out.stdout.txt out.stderr.txt; do
+            if [ -f "$f" ]; then
+              echo -n "$f: "; wc -c "$f" || true
+            else
+              echo "$f: <missing>"
+            fi
+          done
 
-      - name: Upload raw outputs (for debugging)
+          # Hard fail here if we still don't have JSON — Sheets step will be skipped
+          if [ ! -s out.json ]; then
+            echo "out.json is empty — scraper produced no JSON. Not pushing to Sheets." >&2
+            # Return success so artifacts upload runs; Sheets step is gated below
+          fi
+
+      # Always upload artifacts so you can download/inspect them
+      - name: Upload scrape outputs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: scraper-outputs
+          name: scrape-outputs
           path: |
+            out.json
             out.stdout.txt
-            ${{ env.SCRAPER_JSON }}
+            out.stderr.txt
+          if-no-files-found: warn
+          retention-days: 7
 
+      # ---------- PUSH TO GOOGLE SHEETS ----------
       - name: Install Python deps for Sheets
         run: |
           python3 -m pip install --upgrade pip
           python3 -m pip install google-api-python-client pandas
 
       - name: Push to Google Sheets
+        if: ${{ hashFiles('out.json') != '' }}   # only if out.json exists & non-empty
         env:
-          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
-          SHEET_ID: ${{ secrets.SHEET_ID }}
-          SHEET_TAB: ${{ secrets.SHEET_TAB }}
+          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}  # service account JSON (entire file)
+          SHEET_ID:   ${{ secrets.SHEET_ID }}    # spreadsheet ID
+          SHEET_TAB:  ${{ secrets.SHEET_TAB }}   # e.g., Sheet1
         run: |
           python3 - << 'PY'
           import os, json, sys, datetime
@@ -105,80 +121,75 @@ jobs:
           from google.oauth2.service_account import Credentials
           from googleapiclient.discovery import build
 
-          # Choose input: discovered JSON file if present; otherwise parse stdout capture
-          json_path = os.environ.get("SCRAPER_JSON", "").strip()
-          source_label = ""
-          raw = ""
-
-          def read_text(path):
-            with open(path, "r", encoding="utf-8", errors="replace") as f:
-              return f.read().strip()
-
-          if json_path and os.path.isfile(json_path):
-            raw = read_text(json_path)
-            source_label = f"file:{json_path}"
-          else:
-            # Fall back to parsing STDOUT (NDJSON or JSON block)
-            if not os.path.isfile("out.stdout.txt"):
-              print("No JSON file and no out.stdout.txt; nothing to ingest.", file=sys.stderr)
-              sys.exit(0)
-            raw = read_text("out.stdout.txt")
-            source_label = "stdout"
-
-          if not raw:
-            print(f"Empty content from {source_label}", file=sys.stderr)
-            sys.exit(0)
+          # --- Load scraper output ---
+          try:
+              raw = open("out.json","r",encoding="utf-8").read().strip()
+          except FileNotFoundError:
+              print("out.json not found", file=sys.stderr)
+              sys.exit(1)
 
           data = []
-          # Try strict JSON first
-          try:
-            j = json.loads(raw)
-            data = j if isinstance(j, list) else [j]
-          except json.JSONDecodeError:
-            # Fallback: NDJSON / JSON-per-line inside the text
-            for line in raw.splitlines():
-              line=line.strip()
-              if not line: 
-                continue
+          if raw:
               try:
-                data.append(json.loads(line))
-              except Exception:
-                # ignore non-JSON lines
-                pass
+                  j = json.loads(raw)  # array or single object
+                  data = j if isinstance(j, list) else [j]
+              except json.JSONDecodeError:
+                  # NDJSON fallback
+                  for line in raw.splitlines():
+                      line = line.strip()
+                      if not line: 
+                          continue
+                      try:
+                          data.append(json.loads(line))
+                      except Exception:
+                          pass
 
           if not data:
-            print(f"No JSON records parsed from {source_label}.", file=sys.stderr)
-            sys.exit(0)
+              print("No JSON records parsed from scraper output.", file=sys.stderr)
+              sys.exit(0)  # nothing to append; not an error
 
+          # --- Normalize to tabular ---
           df = pd.json_normalize(data)
           now = datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z"
           if "ingested_at" not in df.columns:
-            df["ingested_at"] = now
+              df["ingested_at"] = now
           cols = list(df.columns)
           df = df[cols]
 
+          print("Columns:", cols)
+          print("First rows preview:")
+          print(df.head(min(5, len(df))))
+
+          # --- Auth & write to Sheets ---
           creds = Credentials.from_service_account_info(
-            json.loads(os.environ["GCP_SA_KEY"]),
-            scopes=["https://www.googleapis.com/auth/spreadsheets"]
+              json.loads(os.environ["GCP_SA_KEY"]),
+              scopes=["https://www.googleapis.com/auth/spreadsheets"]
           )
           svc = build("sheets","v4",credentials=creds)
 
-          values = [cols] + df.fillna("").astype(str).values.tolist()
+          sheet_tab = os.environ.get("SHEET_TAB","Sheet1")
+
+          # Check if sheet has any data
           read = svc.spreadsheets().values().get(
-            spreadsheetId=os.environ["SHEET_ID"],
-            range=f"{os.environ.get('SHEET_TAB','Sheet1')}!A1:A1"
+              spreadsheetId=os.environ["SHEET_ID"],
+              range=f"{sheet_tab}!A1:A1"
           ).execute()
           has_any = 'values' in read
+
+          # Prepare values (header on first run)
+          values = [cols] + df.fillna("").astype(str).values.tolist()
           if has_any:
-            values = values[1:]
+              values = values[1:]
 
           if values:
-            svc.spreadsheets().values().append(
-              spreadsheetId=os.environ["SHEET_ID"],
-              range=f"{os.environ.get('SHEET_TAB','Sheet1')}!A1",
-              valueInputOption="RAW",
-              insertDataOption="INSERT_ROWS",
-              body={"values": values}
-            ).execute()
-          print(f"Appended {len(values)} row(s) from {source_label}")
+              svc.spreadsheets().values().append(
+                  spreadsheetId=os.environ["SHEET_ID"],
+                  range=f"{sheet_tab}!A1",
+                  valueInputOption="RAW",
+                  insertDataOption="INSERT_ROWS",
+                  body={"values": values}
+              ).execute()
+              print(f"Appended {len(values)} row(s)")
+          else:
+              print("Nothing to append (values empty).")
           PY

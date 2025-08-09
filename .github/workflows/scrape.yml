@@ -4,7 +4,7 @@ name: scrape
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 1 * * *" # daily at 01:00 UTC - tweak as you like
+    - cron: "0 1 * * *"   # daily at 01:00 UTC
 
 jobs:
   scrape:
@@ -21,12 +21,11 @@ jobs:
         with:
           dotnet-version: 6.0.x
 
-      # Everything runs from ./src so the app finds Urls.txt as per README
       - name: Restore packages
         working-directory: src
         run: dotnet restore
 
-      - name: Build (Debug) — required so playwright.ps1 exists in bin/Debug/net6.0
+      - name: Build (Debug) so playwright.ps1 exists
         working-directory: src
         run: dotnet build -c Debug
 
@@ -35,13 +34,24 @@ jobs:
         shell: pwsh
         run: bin/Debug/net6.0/playwright.ps1 install chromium
 
-      # Optional: sanity check that Urls.txt is present
-      - name: Check Urls.txt
-        working-directory: src
+      # --- Diagnostics to prove where we are and what files exist
+      - name: List important paths
         run: |
-          test -f Urls.txt && echo "Found Urls.txt" || (echo "Urls.txt missing!" && exit 1)
+          echo "PWD = $(pwd)"
+          echo "=== src ==="
+          ls -la src
+          echo "=== bin/Debug/net6.0 ==="
+          ls -la src/bin/Debug/net6.0 || true
 
-      # Run the scraper. It prints a table to stdout (not JSON).
+      # --- Copy Urls.txt to the build output where the app likely reads from
+      - name: Ensure Urls.txt is in runtime folder
+        run: |
+          test -f src/Urls.txt || (echo "src/Urls.txt missing!" && exit 1)
+          cp -f src/Urls.txt src/bin/Debug/net6.0/Urls.txt
+          echo "After copy:"
+          ls -la src/bin/Debug/net6.0 | grep -i Urls.txt || true
+
+      # Run the scraper; capture stdout/stderr to files at repo root
       - name: Run scraper (dry run)
         working-directory: src
         run: |

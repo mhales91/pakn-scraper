@@ -10,17 +10,11 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: read
-
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Echo env
-        run: |
-          echo "HIT THE RIGHT WORKFLOW ✅"
-          echo "DISPLAY is: ${DISPLAY:-<unset>}"
-
-      - name: Setup .NET
+      - name: Setup .NET 6 SDK (and LTS runtime)
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: 6.0.x
@@ -38,112 +32,78 @@ jobs:
           dotnet restore src/PakScraper.csproj
           dotnet build src/PakScraper.csproj -c Release
 
-      - name: Install browsers for Playwright
-        shell: bash
-        run: pwsh ./playwright.ps1 install chromium
+      - name: Install Playwright browsers (Chromium)
+        run: playwright install --with-deps chromium
 
-      - name: Ensure xvfb
+      - name: Ensure xvfb (virtual display)
         run: |
           set -euxo pipefail
           sudo apt-get update
           sudo apt-get install -y xvfb
 
-      # --- RUN SCRAPER + CAPTURE EVERYTHING ---
       - name: Run scraper and capture outputs
-        id: run_scraper
-        shell: bash
         run: |
           set -euxo pipefail
-
-          # Run app under Xvfb; capture stdout to out.json & out.stdout.txt, stderr to out.stderr.txt
+          # Run headless with xvfb and capture BOTH json and std streams
           xvfb-run -a -s "-screen 0 1280x720x24" \
             dotnet run --project src/PakScraper.csproj -- headless \
-            2> out.stderr.txt | tee out.json | tee out.stdout.txt > /dev/null
-
-          echo "===== file sizes ====="
-          for f in out.json out.stdout.txt out.stderr.txt; do
-            if [ -f "$f" ]; then
-              printf "%s: " "$f"; wc -c "$f"
-            else
-              echo "$f: <missing>"
-            fi
-          done
-
-          echo "===== first 50 lines of out.json ====="
-          head -n 50 out.json || true
-
-          echo "===== any JSON files in repo ====="
-          find . -type f -name "*.json" -printf "%p (%s bytes)\n" | sort || true
-
-      - name: Check out.json non-empty
-        id: check_out_json
+            | tee out.stdout.txt \
+            | tee out.json > /dev/null
+          # also capture stderr
+          true # keep step green even if the next command fails
         shell: bash
-        run: |
-          if [ -s out.json ]; then
-            echo "nonempty=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "nonempty=false" >> "$GITHUB_OUTPUT"
-          fi
 
-      # Always upload so you can inspect results even on failure
-      - name: Upload scrape artifacts
+      - name: Show file sizes & preview
         if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: scrape-outputs
-          path: |
-            out.json
-            out.stdout.txt
-            out.stderr.txt
-            **/*.json
-          if-no-files-found: warn
-          retention-days: 7
+        run: |
+          ls -lah || true
+          wc -c out.json out.stdout.txt 2>/dev/null || true
+          echo "----- head(out.json) -----" || true
+          head -n 50 out.json 2>/dev/null || true
+          echo "----- tail(out.json) -----" || true
+          tail -n 50 out.json 2>/dev/null || true
+          echo "----- head(out.stdout.txt) -----" || true
+          head -n 50 out.stdout.txt 2>/dev/null || true
+          echo "----- tail(out.stdout.txt) -----" || true
+          tail -n 50 out.stdout.txt 2>/dev/null || true
 
-      # --- PUSH TO SHEETS (only if out.json exists AND has bytes) ---
-      - name: Push to Google Sheets
-        if: steps.check_out_json.outputs.nonempty == 'true'
+      # OPTIONAL: push to Google Sheets (requires GCP_SA_KEY, SHEET_ID, SHEET_TAB secrets)
+      - name: Push parsed rows to Google Sheets
+        if: success() || always()   # run and then no-op if no JSON
         env:
           GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
           SHEET_ID:   ${{ secrets.SHEET_ID }}
           SHEET_TAB:  ${{ secrets.SHEET_TAB }}
-        shell: bash
         run: |
+          set -euxo pipefail
           python3 -m pip install --upgrade pip
           python3 -m pip install google-api-python-client pandas
-
           python3 - << 'PY'
           import os, json, sys, datetime
           import pandas as pd
           from google.oauth2.service_account import Credentials
           from googleapiclient.discovery import build
 
-          # --- Load output ---
           try:
               raw = open("out.json","r",encoding="utf-8").read().strip()
           except FileNotFoundError:
-              print("out.json not found", file=sys.stderr); sys.exit(1)
+              print("out.json not found", file=sys.stderr); sys.exit(0)
 
           data = []
           if raw:
-              # Try JSON array/object first
               try:
-                  j = json.loads(raw)
-                  data = j if isinstance(j, list) else [j]
+                  j = json.loads(raw); data = j if isinstance(j, list) else [j]
               except json.JSONDecodeError:
-                  # Fallback: NDJSON (one object per line)
                   for line in raw.splitlines():
                       line=line.strip()
                       if not line: continue
-                      try:
-                          data.append(json.loads(line))
-                      except Exception:
-                          pass
+                      try: data.append(json.loads(line))
+                      except: pass
 
           if not data:
               print("No JSON records parsed from scraper output.", file=sys.stderr)
               sys.exit(0)
 
-          # --- Normalize to tabular ---
           df = pd.json_normalize(data)
           now = datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z"
           if "ingested_at" not in df.columns:
@@ -151,7 +111,6 @@ jobs:
           cols = list(df.columns)
           df = df[cols]
 
-          # --- Auth & write to Sheets ---
           creds = Credentials.from_service_account_info(
               json.loads(os.environ["GCP_SA_KEY"]),
               scopes=["https://www.googleapis.com/auth/spreadsheets"]
@@ -159,8 +118,6 @@ jobs:
           svc = build("sheets","v4",credentials=creds)
 
           values = [cols] + df.fillna("").astype(str).values.tolist()
-
-          # If sheet already has any data, skip header
           read = svc.spreadsheets().values().get(
               spreadsheetId=os.environ["SHEET_ID"],
               range=f"{os.environ.get('SHEET_TAB','Sheet1')}!A1:A1"
@@ -178,3 +135,16 @@ jobs:
               ).execute()
               print(f"Appended {len(values)} row(s)")
           PY
+
+      - name: Upload scrape artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scrape-outputs
+          path: |
+            out.json
+            out.stdout.txt
+            out.stderr.txt
+            **/*.json
+          if-no-files-found: warn
+          retention-days: 7

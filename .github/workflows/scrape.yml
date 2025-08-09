@@ -40,44 +40,47 @@ jobs:
           test -f Urls.txt && echo "Found src/Urls.txt" || (echo "src/Urls.txt missing!" && exit 1)
           head -n 3 Urls.txt || true
 
-      # Create appsettings.json as ONE line and copy both files into the runtime folder
       - name: Stage runtime inputs (Urls.txt + appsettings.json) to bin/Debug/net6.0
         working-directory: src
         run: |
           RUNTIME_DIR="bin/Debug/net6.0"
           mkdir -p "$RUNTIME_DIR"
 
-          # Write single-line JSON (no BOM, no trailing comma/newline)
+          # One-line JSON (strict parser)
           printf '{"GEOLOCATION_LAT":"-37.73953","GEOLOCATION_LONG":"176.09528"}' > appsettings.json
-
-          # Show what we wrote
           echo "appsettings.json content:"
           cat appsettings.json
 
-          # Copy inputs into runtime dir (where the app reads from)
           cp Urls.txt "$RUNTIME_DIR/Urls.txt"
           cp appsettings.json "$RUNTIME_DIR/appsettings.json"
-
-          # List for sanity
           echo "Runtime dir contents:"
           ls -la "$RUNTIME_DIR"
 
-      - name: Run scraper (Debug, no rebuild)
+      # Run under Xvfb; never fail the job here — we save the exit code and logs
+      - name: Run scraper (Debug, no rebuild) under xvfb
         working-directory: src
+        timeout-minutes: 30
         run: |
-          set -o pipefail
-          { dotnet run -c Debug --no-build; } \
+          set +e
+          xvfb-run -a dotnet run -c Debug --no-build \
             >  ../out.stdout.txt \
             2> ../out.stderr.txt
-          echo "Exit code: $?"
+          code=$?
+          echo "$code" > ../exit.code
+          echo "Scraper exit code: $code"
+          # Do not fail the step regardless of scraper result
+          exit 0
 
+      # Always upload logs & inputs, even if previous step crashed
       - name: Upload outputs
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: scrape-outputs
           path: |
             out.stdout.txt
             out.stderr.txt
+            exit.code
             src/Urls.txt
             src/appsettings.json
             src/bin/Debug/net6.0/appsettings.json

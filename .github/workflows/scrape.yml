@@ -4,7 +4,7 @@ name: scrape
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 1 * * *"
+    - cron: "0 1 * * *"  # daily 01:00 UTC
 
 jobs:
   scrape:
@@ -34,10 +34,18 @@ jobs:
         shell: pwsh
         run: bin/Debug/net6.0/playwright.ps1 install chromium
 
-      - name: Show tree
+      # 👇 Force a NZ location so the site picks a nearby store (avoids IP geolocation)
+      - name: Write appsettings.json (NZ store coords)
         run: |
-          echo "PWD=$(pwd)"
-          tree -a -L 2 || true
+          mkdir -p src
+          cat > src/appsettings.json <<'JSON'
+          {
+            "GEOLOCATION_LONG": "176.096",   // TGA
+            "GEOLOCATION_LAT":  "–37.741"
+          }
+          JSON
+          echo "---- appsettings.json ----"
+          cat src/appsettings.json
 
       - name: Ensure Urls.txt is in runtime folder
         run: |
@@ -46,22 +54,19 @@ jobs:
           echo "---- head src/Urls.txt ----"; head -n 40 src/Urls.txt || true
           echo "---- head bin/Debug/net6.0/Urls.txt ----"; head -n 40 src/bin/Debug/net6.0/Urls.txt || true
 
-      - name: Install xvfb (safety for headless runs)
+      - name: Install xvfb
         run: sudo apt-get update && sudo apt-get install -y xvfb
 
       - name: Run scraper (dry run) under Xvfb
         working-directory: src
         env:
-          # Make failures obvious in the console but still write files
           DOTNET_CLI_TELEMETRY_OPTOUT: 1
         run: |
           set -o pipefail
           echo "Starting dotnet run at $(date -u)"
-          # capture exit code so we can still dump logs after
           xvfb-run -a -s "-screen 0 1280x720x24" \
             bash -lc '{ dotnet run ; } > ../out.stdout.txt 2> ../out.stderr.txt'; EC=$?
           echo "dotnet run exit code: $EC"
-          # Always print stderr and the tail of stdout for debugging
           echo "-------- out.stderr.txt --------"; (sed -n '1,400p' ../out.stderr.txt || true)
           echo "-------- tail out.stdout.txt --------"; (tail -n 200 ../out.stdout.txt || true)
           exit $EC
@@ -75,4 +80,5 @@ jobs:
             out.stdout.txt
             out.stderr.txt
             src/Urls.txt
+            src/appsettings.json
           if-no-files-found: warn

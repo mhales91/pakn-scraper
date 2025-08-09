@@ -124,6 +124,7 @@ namespace Scraper
                 $"{categorisedUrls.Count} pages to be scraped, " +
                 $"with {secondsDelayBetweenPageScrapes}s delay between each page scrape."
             );
+
             // Open an initial page and allow geolocation set the desired store location
             await OpenInitialPageAndSetLocation();
 
@@ -168,7 +169,7 @@ namespace Scraper
                         await playwrightPage.QuerySelectorAllAsync("div");
 
                     // Verify each element contains an attribute data-testid
-                    // ending in either -EA-000 or-KGM-000"
+                    // ending in either -EA-000 or -KGM-000
                     var productElements = allDivElements.Where(
                         element => (
                             (element.GetAttributeAsync("data-testid").Result ?? "")
@@ -231,7 +232,7 @@ namespace Scraper
                                 string hiResImageUrl = await GetHiresImageUrl(productElement);
 
                                 // Use a REST API to upload product image
-                                if (hiResImageUrl != "" && hiResImageUrl != null)
+                                if (!string.IsNullOrEmpty(hiResImageUrl))
                                 {
                                     await UploadImageUsingRestAPI(hiResImageUrl, scrapedProduct);
                                 }
@@ -345,7 +346,7 @@ namespace Scraper
             string? imgUrl = await imgDiv.Last().GetAttributeAsync("src");
 
             // Check if image is a valid product image, otherwise return blank
-            if (!imgUrl!.Contains("fsimg.co.nz/product/retail/fan/image/")) return "";
+            if (string.IsNullOrEmpty(imgUrl) || !imgUrl.Contains("fsimg.co.nz/product/retail/fan/image/")) return "";
 
             // Swap url from 200x200 or 400x400 to master to get the hi-res version
             imgUrl = Regex.Replace(imgUrl, @"\d00x\d00", "master");
@@ -451,15 +452,6 @@ namespace Scraper
                 LogError($"{name} - Couldn't scrape image URL\n{e.GetType()}");
                 return null;
             }
-
-
-            //     // If multi-item and single-item prices are shown, override with the single-item price
-            //     var singleItemSpan = await productElement.QuerySelectorAsync(".fs-product-card__single-price");
-            //     if (singleItemSpan != null)
-            //     {
-            //         string singleItemInnerText = await singleItemSpan.InnerTextAsync();
-            //         currentPrice = float.Parse(singleItemInnerText.Replace("Single Price $", ""));
-            //     }
 
             // Unit Price - Scrape the unit price if it is listed
             // --------------------------------------------------
@@ -636,6 +628,7 @@ namespace Scraper
 
         // OpenInitialPageAndSetLocation()
         // -------------------------------
+        // Updated: tolerate Cloudflare interstitial and wait for a stable selector.
         private static async Task OpenInitialPageAndSetLocation()
         {
             int maxAttempts = 4;
@@ -643,22 +636,27 @@ namespace Scraper
             {
                 try
                 {
-                    // Set geo-location data
+                    // Set geo-location data (from appsettings or default).
                     await SetGeoLocation();
 
-                    // Goto any page to trigger geo-location detection
-                    await playwrightPage!.GotoAsync("https://www.paknsave.co.nz/");
-                    Thread.Sleep(2000);
+                    // Navigate using DOMContentLoaded so Cloudflare page can render too.
+                    await playwrightPage!.GotoAsync("https://www.paknsave.co.nz/",
+                        new() { WaitUntil = WaitUntilState.DOMContentLoaded, Timeout = 60000 });
 
-                    // Once div.js-quick-links is loaded, the page is ready
+                    // Wait until we’re off the Cloudflare /cdn-cgi/* challenge URLs.
+                    await playwrightPage.WaitForURLAsync(
+                        url => url.StartsWith("https://www.paknsave.co.nz/") && !url.Contains("/cdn-cgi/"),
+                        new() { Timeout = 60000 });
+
+                    // Let network go idle to finish any background requests.
+                    await playwrightPage.WaitForLoadStateAsync(LoadState.NetworkIdle, new() { Timeout = 60000 });
+
+                    // Wait for a stable, real element on the homepage (store name area).
                     await playwrightPage.WaitForSelectorAsync(
-                        "div.js-quick-links",
-                        new PageWaitForSelectorOptions()
-                        {
-                            Timeout = 10000
-                        }
-                    );
-                    break;
+                        "span.fs-selected-store__name",
+                        new PageWaitForSelectorOptions { Timeout = 10000 });
+
+                    break; // success
                 }
                 catch (Exception)
                 {
@@ -668,6 +666,8 @@ namespace Scraper
                         throw new Exception("Unable to load initial page");
                     }
                     LogWarn($"Retrying Geolocation Detection {attempt + 1}/{maxAttempts}");
+                    // Small backoff to avoid hammering during challenge
+                    await Task.Delay(3000);
                 }
             }
 

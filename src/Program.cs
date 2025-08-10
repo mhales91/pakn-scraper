@@ -32,6 +32,7 @@ namespace Scraper
             DatedPrice[] priceHistory,
             DateTime lastUpdated,
             DateTime lastChecked,
+
             float? unitPrice,
             string? unitName,
             float? originalUnitQuantity
@@ -64,6 +65,7 @@ namespace Scraper
                     // Connect to CosmosDB - end program if unable to connect
                     if (!await CosmosDB.EstablishConnection(
                         db: "supermarket-prices",
+             
                         partitionKey: "/name",
                         container: "products"
                     )) return;
@@ -753,10 +755,11 @@ namespace Scraper
 
         private static async Task RoutePlaywrightExclusions(bool logToConsole = false)
         {
-            // Define excluded types and urls to reject
-            string[] typeExclusions = { "image", "media", "font", "other" };
+            // Define  types and urls to reject
+        
+          
             string[] urlExclusions = { "googleoptimize.com", "gtm.js", "visitoridentification.js",
-                "js-agent.newrelic.com", "challenge-platform" };
+                "js-agent.newrelic.com
             List<string> exclusions = urlExclusions.ToList<string>();
 
             // Route with exclusions processed
@@ -767,6 +770,7 @@ namespace Scraper
                 string trimmedUrl = req.Url.Length > 120 ? req.Url.Substring(0, 120) + "..." : req.Url;
 
                 foreach (string exclusion in exclusions)
+                    
                 {
                     if (req.Url.Contains(exclusion)) excludeThisRequest = true;
                 }
@@ -786,3 +790,4 @@ namespace Scraper
         }
     }
 }
+
